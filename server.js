@@ -125,35 +125,47 @@ async function startSlot(slot) {
 
   /* conexión */
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-    if (qr) sessions[slot].qr = qr;
+  // ① si llegó QR, guárdalo y marca estado 'qr' (para el front)
+  if (qr) {
+    sessions[slot].qr = qr;
+    sessions[slot].status = 'qr';
+    log.info({ slot }, 'QR disponible para escanear');
+  }
 
-    if (connection === 'open') {
-      sessions[slot].status = 'connected';
-      sessions[slot].qr = null;
-      sessions[slot].me = sock.user;
-      log.info({ slot }, 'Conectado');
+  if (connection === 'open') {
+    sessions[slot].status = 'connected';
+    sessions[slot].qr = null;
+    sessions[slot].me = sock.user;
+    log.info({ slot }, 'Conectado');
+  } else if (connection === 'close') {
+    const code = lastDisconnect?.error?.output?.statusCode;
+    log.warn({ slot, code }, 'Desconectado, reintentando…');
+    if (code !== DisconnectReason.loggedOut) startSlot(slot);
+    else sessions[slot].status = 'logged_out';
+  } else if (connection) {
+    sessions[slot].status = connection; // 'connecting', etc.
+  }
+});
 
-      // Backfill 1 sola vez al abrir
-      if (!sessions[slot].isBackfilled) {
-        try {
-          await backfillAllChats(slot);
-          sessions[slot].isBackfilled = true;
-        } catch (e) {
-          log.error({ slot, err: String(e) }, 'backfill fallo');
-        }
-      }
-    } else if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      log.warn({ slot, code }, 'Desconectado, reintentando…');
-      if (code !== DisconnectReason.loggedOut) {
-        setTimeout(()=>startSlot(slot), 1500);
-      } else {
-        sessions[slot].status = 'logged_out';
-      }
-    } else if (connection) {
-      sessions[slot].status = connection;
-    }
-  });
+// Ver el texto del QR (debug)
+app.get('/qr-text/:slot', (req, res) => {
+  const slot = req.params.slot;
+  const sess = sessions[slot];
+  if (!sess) return res.status(404).json({ error: 'slot no existe' });
+  if (!sess.qr) return res.status(204).end();
+  res.type('text/plain').send(sess.qr);
+});
+
+// Ya lo tienes, pero lo dejo por claridad
+app.get('/qr/:slot', async (req, res) => {
+  const slot = req.params.slot;
+  const sess = sessions[slot];
+  if (!sess) return res.status(404).json({ error: 'slot no existe' });
+  if (!sess.qr) return res.status(204).end();
+  const png = await QRCode.toBuffer(sess.qr, { margin: 1, scale: 6 });
+  res.setHeader('Content-Type', 'image/png');
+  res.send(png);
+});
 
   /* historial inicial de WA */
   sock.ev.on('messaging-history.set', ({ messages, isLatest }) => {
@@ -347,7 +359,6 @@ app.post('/logout/:slot', async (req, res) => {
   }
   try {
     const sess = sessions[slot];
-
     try { await sess?.sock?.logout?.(); } catch (e) { log.warn({ slot, e: String(e) }, 'logout() falló'); }
     try { sess?.sock?.end?.(); } catch (_) {}
     try { sess?.sock?.ws?.close?.(); } catch (_) {}
@@ -356,13 +367,14 @@ app.post('/logout/:slot', async (req, res) => {
     delete sessions[slot];
     try { fs.rmSync(`data/auth_${slot}`, { recursive: true, force: true }); } catch (_) {}
 
-    await startSlot(slot); // reinicia: quedará “starting” y emitirá QR
+    await startSlot(slot);               // ← reinicia: emitirá QR y sessions[slot].status = 'qr'
     res.json({ ok:true, slot, restarted:true });
   } catch (err) {
     log.error({ slot, err: String(err) }, 'logout_failed');
     res.status(500).json({ ok:false, error:'logout_failed' });
   }
 });
+
 
 /* tags / health */
 app.post('/tag', (req, res) => {
