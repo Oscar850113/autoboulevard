@@ -303,6 +303,28 @@ app.get('/chats', (req, res) => {
   }));
   res.json(rows);
 });
+// Forzar logout y volver a pedir QR para un slot
+app.post('/logout/:slot', async (req, res) => {
+  const slot = req.params.slot;
+  const sess = sessions[slot];
+  try {
+    if (sess?.sock) {
+      try { await sess.sock.logout(); }
+      catch (e) { log.warn({ slot, err: String(e) }, 'logout() falló, borro auth igualmente'); }
+    }
+    // borrar credenciales y sesión en disco
+    try { fs.rmSync(`data/auth_${slot}`, { recursive: true, force: true }); } catch (_) {}
+    delete sessions[slot];
+
+    // arrancar de cero para que emita QR
+    await startSlot(slot);
+
+    res.json({ ok: true });
+  } catch (err) {
+    log.error({ slot, err }, 'logout error');
+    res.status(500).json({ ok: false, error: 'logout_failed' });
+  }
+});
 
 /* historial por contacto */
 app.get('/history', (req, res) => {
@@ -324,3 +346,4 @@ app.post('/tag', (req, res) => {
 app.get('/health', (_, res)=>res.json({ ok:true }));
 
 app.listen(PORT, () => log.info(`API espejo en :${PORT}`));
+
