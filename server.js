@@ -50,7 +50,7 @@ const insMsg = db.prepare(`
   VALUES (@slot, @jid, @from_number, @ts, @type, @text)
 `);
 const selLast = db.prepare(`
-  SELECT slot, from_number, ts, type, text
+  SELECT slot, jid, from_number, ts, type, text
   FROM messages
   WHERE (? IS NULL OR slot = ?) AND ts BETWEEN ? AND ?
   ORDER BY ts DESC LIMIT ?
