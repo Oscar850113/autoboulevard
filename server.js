@@ -255,6 +255,49 @@ async function backfillAllChats(slot) {
   log.info({ slot }, 'CLONE backfill done');
 }
 
+// --- helper opcional para cerrar sesión/limpiar ---
+async function resetSlot(slot) {
+  const sess = sessions[slot];
+
+  // Intenta cerrar sesión en WA (si está conectada)
+  try { await sess?.sock?.logout?.(); } catch (e) { log.warn({ slot, e: String(e) }, 'logout() falló'); }
+  try { sess?.sock?.end?.(); } catch (_) {}
+  try { sess?.sock?.ws?.close?.(); } catch (_) {}
+
+  // Limpia listeners y sesión en memoria
+  try { sess?.sock?.ev?.removeAllListeners?.(); } catch (_) {}
+  delete sessions[slot];
+
+  // Borra credenciales locales del slot
+  try { fs.rmSync(`data/auth_${slot}`, { recursive: true, force: true }); } catch (_) {}
+
+  // Reinicia el slot -> el estado quedará "starting" y luego emitirá QR
+  await startSlot(slot);
+}
+
+// --- CORS (si quieres ser explícito con métodos/post) ---
+app.use(cors({
+  origin: ORIGIN,
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type']
+}));
+app.options('*', cors());
+
+// --- NUEVO: logout de un slot ---
+app.post('/logout/:slot', async (req, res) => {
+  const slot = (req.params.slot || '').trim();
+  if (!slot || !SLOTS.includes(slot)) {
+    return res.status(400).json({ ok:false, error:'invalid_slot' });
+  }
+  try {
+    await resetSlot(slot);
+    res.json({ ok:true, slot, restarted:true });
+  } catch (err) {
+    log.error({ slot, err }, 'logout_failed');
+    res.status(500).json({ ok:false, error:'logout_failed' });
+  }
+});
+
 /* ===== arrancar slots ===== */
 for (const s of SLOTS) startSlot(s);
 
