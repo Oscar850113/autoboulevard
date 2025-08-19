@@ -4,16 +4,12 @@ import cors from 'cors';
 import Database from 'better-sqlite3';
 import QRCode from 'qrcode';
 import pino from 'pino';
-import makeDebug from 'debug';
 import {
   makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  DisconnectReason,
-  makeInMemoryStore
+  DisconnectReason
 } from '@whiskeysockets/baileys';
-
-const debug = makeDebug('mirror');
 
 const PORT   = process.env.PORT || 3000;
 const ORIGIN = process.env.ALLOW_ORIGIN || '*';
@@ -26,9 +22,8 @@ const app = express();
 app.use(cors({ origin: ORIGIN }));
 app.use(express.json());
 
-/* ============ DB ============ */
+/* ==== DB ==== */
 const db = new Database('data/wa.db');
-db.pragma('journal_mode = WAL');
 db.exec(`
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,65 +34,47 @@ CREATE TABLE IF NOT EXISTS messages(
   type TEXT,
   text TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_ts ON messages(ts);
+CREATE INDEX IF NOT EXISTS idx_ts   ON messages(ts);
 CREATE INDEX IF NOT EXISTS idx_slot ON messages(slot);
-CREATE INDEX IF NOT EXISTS idx_slot_from ON messages(slot, from_number);
-
-CREATE TABLE IF NOT EXISTS tags(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  from_number TEXT NOT NULL,
-  tag TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
+CREATE INDEX IF NOT EXISTS idx_pair ON messages(slot, from_number, ts DESC);
 `);
-
 const insMsg = db.prepare(`
   INSERT INTO messages (slot, jid, from_number, ts, type, text)
   VALUES (@slot, @jid, @from_number, @ts, @type, @text)
 `);
-
-const selLast = db.prepare(`
+const selLastRange = db.prepare(`
   SELECT slot, jid, from_number, ts, type, text
   FROM messages
   WHERE (? IS NULL OR slot = ?) AND ts BETWEEN ? AND ?
+  ORDER BY ts DESC LIMIT ?
+`);
+const selChats = db.prepare(`
+  SELECT m.slot,
+         m.from_number,
+         MAX(m.ts)                             AS last_ts,
+         (SELECT text FROM messages x
+           WHERE x.slot=m.slot AND x.from_number=m.from_number
+           ORDER BY ts DESC LIMIT 1)           AS last_text,
+         (SELECT type FROM messages x
+           WHERE x.slot=m.slot AND x.from_number=m.from_number
+           ORDER BY ts DESC LIMIT 1)           AS last_type
+  FROM messages m
+  WHERE (?='all' OR m.slot=?)
+  GROUP BY m.slot, m.from_number
+  ORDER BY last_ts DESC
+  LIMIT ?
+`);
+const selHistoryDesc = db.prepare(`
+  SELECT slot, jid, from_number, ts, type, text
+  FROM messages
+  WHERE slot = ? AND from_number = ?
+    AND (? IS NULL OR ts < ?)
   ORDER BY ts DESC
   LIMIT ?
 `);
 
-/* último mensaje por contacto (bandeja) */
-const selThreads = db.prepare(`
-  SELECT 
-    m.slot,
-    m.from_number,
-    MAX(m.ts) AS ts,
-    /* últimos text/type mediante subconsulta */
-    (SELECT text FROM messages 
-      WHERE slot=m.slot AND from_number=m.from_number 
-      ORDER BY ts DESC LIMIT 1) AS text,
-    (SELECT type FROM messages 
-      WHERE slot=m.slot AND from_number=m.from_number 
-      ORDER BY ts DESC LIMIT 1) AS type
-  FROM messages m
-  WHERE m.from_number IS NOT NULL AND m.from_number <> ''
-  GROUP BY m.slot, m.from_number
-  ORDER BY ts DESC
-  LIMIT @limit
-`);
-
-/* historia de un contacto */
-const selHistory = db.prepare(`
-  SELECT slot, from_number, ts, type, text
-  FROM messages
-  WHERE slot=@slot AND from_number=@from
-    AND (@before IS NULL OR ts < @before)
-  ORDER BY ts DESC
-  LIMIT @limit
-`);
-
-/* ============ WA SESSIONS ============ */
-const sessions = {}; // slot -> { sock, qr, status, me, store }
-
-const toTel = (jid) => (jid || '').replace(/@.*/, '');
+const sessions = {}; // slot -> { sock, qr, status, me }
+const toTel = (jid) => (jid||'').replace(/@.*/, '');
 
 function extractText(message) {
   const msg = message || {};
@@ -110,34 +87,51 @@ function extractText(message) {
     msg.templateButtonReplyMessage?.selectedDisplayText ??
     msg.listResponseMessage?.title ??
     msg.reactionMessage?.text ??
-    '[mensaje no soportado]'
+    '' // vacío si no hay texto legible
   );
 }
 
-function insertMany(slot, arr) {
-  const tx = db.transaction(rows => { rows.forEach(r => insMsg.run(r)); });
-  tx(arr);
+async function persistMessages(slot, list = []) {
+  const rows = [];
+  for (const m of list) {
+    const remoteJid  = m?.key?.remoteJid;
+    const participant = m?.key?.participant; // en grupos
+    if (!remoteJid && !participant) continue;
+
+    const tel  = toTel(remoteJid) || toTel(participant);
+    const fromMe = !!m?.key?.fromMe;
+    const text = extractText(m.message || {});
+    const tsMs = Number(m.messageTimestamp || m.timestamp || Math.floor(Date.now()/1000)) * 1000;
+
+    rows.push({
+      slot,
+      jid: remoteJid || participant,
+      from_number: tel,
+      ts: tsMs,
+      type: fromMe ? 'out' : 'in',
+      text
+    });
+  }
+  const tx = db.transaction((items)=>{ for (const r of items) insMsg.run(r); });
+  tx(rows);
+  if (rows.length) log.info({ slot, saved: rows.length }, 'guardados');
 }
 
 async function startSlot(slot) {
   const { state, saveCreds } = await useMultiFileAuthState(`data/auth_${slot}`);
   const { version } = await fetchLatestBaileysVersion();
-  const store = makeInMemoryStore({ logger: log });
 
   const sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: ['AutoBoulevard Dashboard', 'Chrome', '1.0'],
-    emitOwnEvents: true,     // incluir mensajes propios
-    syncFullHistory: true,   // sincroniza historial al conectar
-    markOnlineOnConnect: false
+    browser: ['Mirror Dashboard','Chrome','1.0'],
+    emitOwnEvents: true,
+    // ⚠️ esto pide el historial inicial (history sync)
+    syncFullHistory: true
   });
 
-  store.bind(sock.ev);
-
-  sessions[slot] = { sock, store, qr: null, status: 'starting', me: null };
-
+  sessions[slot] = { sock, qr: null, status: 'starting', me: null };
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', ({ connection, qr, lastDisconnect }) => {
@@ -157,64 +151,33 @@ async function startSlot(slot) {
     }
   });
 
-  // set de mensajes inicial (historial)
-  sock.ev.on('messages.set', (payload) => {
-    const { messages = [], isLatest } = payload || {};
-    if (!messages.length) return;
-    const rows = [];
-    for (const m of messages) {
-      const remoteJid = m?.key?.remoteJid;
-      if (!remoteJid) continue;
-      const fromMe = !!m?.key?.fromMe;
-      const participant = m?.key?.participant;
-      const tel = toTel(remoteJid) || toTel(participant);
-      const msg = m.message || {};
-      rows.push({
-        slot,
-        jid: remoteJid,
-        from_number: tel,
-        ts: (m.messageTimestamp || m.timestamp || Math.floor(Date.now()/1000))*1000,
-        type: fromMe ? 'out' : 'in',
-        text: extractText(msg)
-      });
-    }
-    if (rows.length) {
-      debug('messages.set', slot, rows.length, 'isLatest:', !!isLatest);
-      insertMany(slot, rows);
-    }
+  // 🔹 history sync inicial: Baileys manda “messages.set”
+  sock.ev.on('messages.set', async ({ messages, isLatest }) => {
+    log.info({ slot, count: messages?.length || 0, isLatest }, 'messages.set');
+    if (messages?.length) await persistMessages(slot, messages);
   });
 
-  // upserts (novedades en tiempo real)
-  sock.ev.on('messages.upsert', ({ messages = [] }) => {
-    if (!messages.length) return;
-    const rows = [];
-    for (const m of messages) {
-      const remoteJid = m?.key?.remoteJid;
-      if (!remoteJid) continue;
-      const fromMe = !!m?.key?.fromMe;
-      const participant = m?.key?.participant;
-      const tel = toTel(remoteJid) || toTel(participant);
-      const msg = m.message || {};
-      rows.push({
-        slot,
-        jid: remoteJid,
-        from_number: tel,
-        ts: (m.messageTimestamp || m.timestamp || Math.floor(Date.now()/1000))*1000,
-        type: fromMe ? 'out' : 'in',
-        text: extractText(msg)
-      });
-    }
-    if (rows.length) {
-      debug('messages.upsert', slot, rows.length);
-      insertMany(slot, rows);
-    }
+  // 🔹 mensajes nuevos / cambios
+  sock.ev.on('messages.upsert', async ({ type, messages }) => {
+    log.info({ slot, type, count: messages?.length || 0 }, 'messages.upsert');
+    if (messages?.length) await persistMessages(slot, messages);
   });
+
+  // 🔹 utilitario: cargar más historial de un chat bajo demanda
+  sock.loadMoreFor = async (remoteJid, cursorId, count = 100) => {
+    const cursor = cursorId
+      ? { id: cursorId, fromMe: false, remoteJid }
+      : undefined;
+    const page = await sock.loadMessages(remoteJid, count, cursor);
+    await persistMessages(slot, page);
+    return page;
+  };
 }
 
-// arrancar las sesiones configuradas
+// levantar sesiones
 for (const s of SLOTS) startSlot(s);
 
-/* ============ API ============ */
+/* ==== API ==== */
 
 // QR (PNG)
 app.get('/qr/:slot', async (req, res) => {
@@ -227,7 +190,7 @@ app.get('/qr/:slot', async (req, res) => {
   res.send(png);
 });
 
-// Estado de sesiones
+// Estado
 app.get('/status', (req, res) => {
   const out = {};
   for (const s of SLOTS) {
@@ -237,77 +200,45 @@ app.get('/status', (req, res) => {
   res.json(out);
 });
 
-// Últimos mensajes (rango)
+// Últimos (rango)
 app.get('/last', (req, res) => {
-  const { slot, start, end, limit = 100 } = req.query;
+  const { slot, start, end, limit = 500 } = req.query;
   const from = start ? new Date(start + 'T00:00:00Z').getTime() : 0;
   const to   = end   ? new Date(end   + 'T23:59:59Z').getTime() : Date.now();
-  const rows = selLast.all(slot || null, slot || null, from, to, Math.min(Number(limit), 1000));
+  const rows = selLastRange.all(slot || null, slot || null, from, to, Math.min(Number(limit), 2000));
   res.json(rows);
 });
 
-/* BANDEJA: último mensaje por contacto */
+// Bandeja (conversaciones)
 app.get('/chats', (req, res) => {
+  const slot  = (req.query.slot || 'all').toString().toLowerCase();
   const limit = Math.min(Number(req.query.limit || 500), 2000);
-  const rows = selThreads.all({ limit });
-  res.json(rows.map(r => ({
+  const rows  = selChats.all(slot, slot, limit).map(r => ({
     slot: r.slot,
     from_number: r.from_number,
-    ts: r.ts,
-    lastText: r.text || '',
-    lastType: r.type || 'in'
-  })));
+    last_ts: r.last_ts,
+    last_text: r.last_text || '',
+    last_type: r.last_type || 'in'
+  }));
+  res.json(rows);
 });
 
-/* HISTORIA DE UN CONTACTO (paginable) */
+// Historial por conversación (paginado)
 app.get('/history', (req, res) => {
-  const slot = (req.query.slot || '').toLowerCase();
-  const from = req.query.from || '';
-  if (!slot || !from) return res.status(400).json({ error: 'slot y from son requeridos' });
-
-  const limit = Math.min(Number(req.query.limit || 200), 2000);
+  const slot  = (req.query.slot || '').toString().toLowerCase();
+  const from  = (req.query.from || '').toString();
   const before = req.query.before ? Number(req.query.before) : null;
+  const limit = Math.min(Number(req.query.limit || 200), 500);
 
-  const rows = selHistory.all({ slot, from, limit, before });
-  // devolvemos ascendente para pintar el chat en orden natural
-  res.json(rows.slice().reverse());
+  if (!slot || !from) return res.status(400).json({ error: 'slot y from requeridos' });
+
+  const desc = selHistoryDesc.all(slot, from, before, before, limit);
+  // devolvemos ascendente para pintar burbujas en orden
+  const asc = desc.slice().reverse();
+  res.json(asc);
 });
 
-// Stats simples
-app.get('/stats', (req, res) => {
-  const { range = 'month', slot = 'all' } = req.query;
-  const now = new Date();
-  let start;
-  if (range === 'week') start = new Date(now.getTime() - 6*864e5);
-  else if (range === 'fortnight') start = new Date(now.getTime() - 14*864e5);
-  else start = new Date(now.getTime() - 30*864e5);
-  start.setHours(0,0,0,0);
-  const end = new Date(); end.setHours(23,59,59,999);
-
-  const stmt = db.prepare(`
-    SELECT slot, COUNT(*) AS messages, COUNT(DISTINCT from_number) AS unique_clients
-    FROM messages
-    WHERE ts BETWEEN ? AND ? AND (?='all' OR slot=?)
-    GROUP BY slot
-  `);
-  const rows = stmt.all(start.getTime(), end.getTime(), slot, slot);
-  const totals = rows.reduce((a,r)=>({
-    messages: a.messages + r.messages,
-    unique_clients: a.unique_clients + r.unique_clients
-  }), { messages:0, unique_clients:0 });
-  res.json({ range, slot, totals, per_slot: rows });
-});
-
-// Etiquetas
-app.post('/tag', (req, res) => {
-  const { from_number, tag = 'potential' } = req.body || {};
-  if (!from_number) return res.status(400).json({ error: 'from_number requerido' });
-  db.prepare(`INSERT INTO tags (from_number, tag, created_at) VALUES (?,?,?)`)
-    .run(from_number, tag, Date.now());
-  res.json({ ok: true });
-});
-
-// Health
+// Healthcheck
 app.get('/health', (_, res)=>res.json({ ok:true }));
 
 app.listen(PORT, () => log.info(`API espejo en :${PORT}`));
