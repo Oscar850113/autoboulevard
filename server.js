@@ -67,8 +67,10 @@ async function startSlot(slot) {
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: ['AutoBoulevard Dashboard', 'Chrome', '1.0'],
-    syncFullHistory: false
+    browser: ['AutoBoulevard Dashboard','Chrome','1.0'],
+    // IMPORTANTE:
+    emitOwnEvents: true,          // asegura que también recibas tus mensajes salientes
+    syncFullHistory: false        // no backfill automático (puedes poner true si quieres probar)
   });
 
   sessions[slot] = { sock, qr: null, status: 'starting', me: null };
@@ -80,10 +82,10 @@ async function startSlot(slot) {
       sessions[slot].status = 'connected';
       sessions[slot].qr = null;
       sessions[slot].me = sock.user;
-      log.info({ slot }, '✅ Conectado');
+      log.info({ slot }, 'Conectado');
     } else if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
-      log.warn({ slot, code }, '⚠️ Desconectado, reintentando…');
+      log.warn({ slot, code }, 'Desconectado, reintentando…');
       if (code !== DisconnectReason.loggedOut) startSlot(slot);
       else sessions[slot].status = 'logged_out';
     } else if (connection) {
@@ -91,53 +93,41 @@ async function startSlot(slot) {
     }
   });
 
+  // Helper robusto para extraer texto “humano”
+  function extractText(message) {
+    const msg = message || {};
+    return (
+      msg.conversation ??
+      msg.extendedTextMessage?.text ??
+      msg.imageMessage?.caption ??
+      msg.videoMessage?.caption ??
+      msg.buttonsResponseMessage?.selectedDisplayText ??
+      msg.templateButtonReplyMessage?.selectedDisplayText ??
+      msg.listResponseMessage?.title ??
+      msg.reactionMessage?.text ??
+      '[mensaje no soportado]'
+    );
+  }
+
+  // Para grupos, a veces el número está en participant
+  const toTel = (jid) => (jid||'').replace(/@.*/, '');
+
   sock.ev.on('messages.upsert', ({ messages }) => {
-    console.log(`🟢 ${messages.length} mensaje(s) recibidos para ${slot}`);
+    log.info({ slot, count: messages.length }, 'Mensajes recibidos');
     for (const m of messages) {
-      const remoteJid = m.key.remoteJid;
-      if (!remoteJid || !toTel(remoteJid)) {
-        console.warn(`⚠️ remoteJid inválido`, m);
-        continue;
-      }
+      const remoteJid = m?.key?.remoteJid;
+      if (!remoteJid) continue;
 
-      const fromMe = m.key.fromMe;
-      const msg = m.message || {};
-
-let text = '';
-
-if (msg.conversation) text = msg.conversation;
-else if (msg.extendedTextMessage?.text) text = msg.extendedTextMessage.text;
-else if (msg.imageMessage?.caption) text = msg.imageMessage.caption;
-else if (msg.videoMessage?.caption) text = msg.videoMessage.caption;
-else if (msg.documentMessage?.caption) text = msg.documentMessage.caption;
-else if (msg.buttonsResponseMessage?.selectedButtonId) text = msg.buttonsResponseMessage.selectedButtonId;
-else if (msg.listResponseMessage?.title) text = msg.listResponseMessage.title;
-else if (msg.listResponseMessage?.singleSelectReply?.selectedRowId) text = msg.listResponseMessage.singleSelectReply.selectedRowId;
-else if (msg.templateButtonReplyMessage?.selectedId) text = msg.templateButtonReplyMessage.selectedId;
-else if (msg.messageContextInfo?.quotedMessage?.conversation) text = msg.messageContextInfo.quotedMessage.conversation;
-else if (msg.reactionMessage?.text) text = `Reaccionó: ${msg.reactionMessage.text}`;
-else if (msg.audioMessage) text = '[audio]';
-else if (msg.stickerMessage) text = '[sticker]';
-else if (msg.contactMessage) text = '[contacto]';
-else if (msg.locationMessage) text = '[ubicación]';
-else if (msg.documentMessage) text = '[documento]';
-else text = '[mensaje no soportado]';
-
+      const fromMe = !!m?.key?.fromMe;
+      const participant = m?.key?.participant; // grupos
+      const tel = toTel(remoteJid) || toTel(participant);
+      if (!tel) continue;
 
       const row = {
         slot,
         jid: remoteJid,
-        from_number: toTel(remoteJid),
-        ts: (m.messageTimestamp || m.timestamp || Math.floor(Date.now() / 1000)) * 1000,
-        type: fromMe ? 'out' : 'in',
-        text
-      };
-
-      console.log(`💬 Guardando mensaje`, row);
-      insMsg.run(row);
-    }
-  });
-}
+        from_number: tel,
+        ts: (m.messageTimestamp || m.timestamp || Math.flo
 
 
 // arranca las 3 sesiones
