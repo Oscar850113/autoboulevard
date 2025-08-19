@@ -1,5 +1,5 @@
 {
-  "name": "autoboulevard-api",
+  "name": "mirror-api",
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
