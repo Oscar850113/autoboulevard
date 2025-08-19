@@ -8,63 +8,73 @@ import {
   makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  DisconnectReason
+  DisconnectReason,
+  makeInMemoryStore
 } from '@whiskeysockets/baileys';
 
 const PORT   = process.env.PORT || 3000;
 const ORIGIN = process.env.ALLOW_ORIGIN || '*';
-const SLOTS  = (process.env.SLOTS || 'slot1,slot2,slot3').split(',').map(s=>s.trim());
+const SLOTS  = (process.env.SLOTS || 'slot1,slot2,slot3').split(',').map(s => s.trim());
 
 fs.mkdirSync('data', { recursive: true });
-const log = pino({ level: 'info' });
+const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 
+/* ====== APP ====== */
 const app = express();
 app.use(cors({ origin: ORIGIN }));
 app.use(express.json());
 
-/* ==== DB ==== */
+/* ====== DB ====== */
 const db = new Database('data/wa.db');
+db.pragma('journal_mode = WAL');
 db.exec(`
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   slot TEXT NOT NULL,
-  jid TEXT NOT NULL,
+  jid  TEXT NOT NULL,
   from_number TEXT,
-  ts INTEGER NOT NULL,
+  ts   INTEGER NOT NULL,
   type TEXT,
   text TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_ts   ON messages(ts);
-CREATE INDEX IF NOT EXISTS idx_slot ON messages(slot);
-CREATE INDEX IF NOT EXISTS idx_pair ON messages(slot, from_number, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_ts    ON messages(ts);
+CREATE INDEX IF NOT EXISTS idx_slot  ON messages(slot);
+CREATE INDEX IF NOT EXISTS idx_from  ON messages(from_number);
+
+-- Evitar duplicados “casi idénticos”
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_msg
+ON messages(slot, jid, ts, type, text);
 `);
+
 const insMsg = db.prepare(`
-  INSERT INTO messages (slot, jid, from_number, ts, type, text)
+  INSERT OR IGNORE INTO messages (slot, jid, from_number, ts, type, text)
   VALUES (@slot, @jid, @from_number, @ts, @type, @text)
 `);
+
 const selLastRange = db.prepare(`
   SELECT slot, jid, from_number, ts, type, text
   FROM messages
   WHERE (? IS NULL OR slot = ?) AND ts BETWEEN ? AND ?
-  ORDER BY ts DESC LIMIT ?
-`);
-const selChats = db.prepare(`
-  SELECT m.slot,
-         m.from_number,
-         MAX(m.ts)                             AS last_ts,
-         (SELECT text FROM messages x
-           WHERE x.slot=m.slot AND x.from_number=m.from_number
-           ORDER BY ts DESC LIMIT 1)           AS last_text,
-         (SELECT type FROM messages x
-           WHERE x.slot=m.slot AND x.from_number=m.from_number
-           ORDER BY ts DESC LIMIT 1)           AS last_type
-  FROM messages m
-  WHERE (?='all' OR m.slot=?)
-  GROUP BY m.slot, m.from_number
-  ORDER BY last_ts DESC
+  ORDER BY ts DESC
   LIMIT ?
 `);
-const selHistoryDesc = db.prepare(`
+
+const selInbox = db.prepare(`
+  -- último mensaje por contacto y slot
+  SELECT m.*
+  FROM messages m
+  JOIN (
+    SELECT slot, from_number, MAX(ts) AS max_ts
+    FROM messages
+    WHERE from_number IS NOT NULL AND from_number <> ''
+    GROUP BY slot, from_number
+  ) t
+  ON m.slot = t.slot AND m.from_number = t.from_number AND m.ts = t.max_ts
+  ORDER BY m.ts DESC
+  LIMIT ?
+`);
+
+const selHistory = db.prepare(`
   SELECT slot, jid, from_number, ts, type, text
   FROM messages
   WHERE slot = ? AND from_number = ?
@@ -73,74 +83,153 @@ const selHistoryDesc = db.prepare(`
   LIMIT ?
 `);
 
-const sessions = {}; // slot -> { sock, qr, status, me }
-const toTel = (jid) => (jid||'').replace(/@.*/, '');
+/* ====== UTILS ====== */
+const toTel = (jid) => (jid || '').replace(/@.*/, '');
+const normTs = (m) => (m.messageTimestamp || m.timestamp || Math.floor(Date.now()/1000)) * 1000;
+const extractText = (message = {}) =>
+  message.conversation ??
+  message.extendedTextMessage?.text ??
+  message.imageMessage?.caption ??
+  message.videoMessage?.caption ??
+  message.buttonsResponseMessage?.selectedDisplayText ??
+  message.templateButtonReplyMessage?.selectedDisplayText ??
+  message.listResponseMessage?.title ??
+  message.reactionMessage?.text ??
+  '[sin texto]';
 
-function extractText(message) {
-  const msg = message || {};
-  return (
-    msg.conversation ??
-    msg.extendedTextMessage?.text ??
-    msg.imageMessage?.caption ??
-    msg.videoMessage?.caption ??
-    msg.buttonsResponseMessage?.selectedDisplayText ??
-    msg.templateButtonReplyMessage?.selectedDisplayText ??
-    msg.listResponseMessage?.title ??
-    msg.reactionMessage?.text ??
-    '' // vacío si no hay texto legible
-  );
+/* ====== SESSIONS ====== */
+const sessions = {}; // slot -> { sock, store, qr, status, me, backfilled }
+
+/**
+ * Guarda 1 mensaje en SQLite (con normalización segura).
+ */
+function saveRow(slot, jid, fromMe, msgNode, ts) {
+  const text = extractText(msgNode) || '';
+  const row = {
+    slot,
+    jid,
+    from_number: toTel(jid) || null,
+    ts: ts || Date.now(),
+    type: fromMe ? 'out' : 'in',
+    text
+  };
+  insMsg.run(row);
 }
 
-async function persistMessages(slot, list = []) {
-  const rows = [];
-  for (const m of list) {
-    const remoteJid  = m?.key?.remoteJid;
-    const participant = m?.key?.participant; // en grupos
-    if (!remoteJid && !participant) continue;
+/**
+ * Descarga historial para un jid.
+ * Intenta con loadMessages (v6+) y con fetchMessagesFromWA (fallback).
+ */
+async function pullHistoryForJid(slot, sock, jid, max = 200) {
+  let fetched = 0;
+  let cursor  = null;
 
-    const tel  = toTel(remoteJid) || toTel(participant);
-    const fromMe = !!m?.key?.fromMe;
-    const text = extractText(m.message || {});
-    const tsMs = Number(m.messageTimestamp || m.timestamp || Math.floor(Date.now()/1000)) * 1000;
+  while (fetched < max) {
+    let batch = [];
+    try {
+      if (typeof sock.loadMessages === 'function') {
+        batch = await sock.loadMessages(jid, Math.min(50, max - fetched), cursor);
+      } else if (typeof sock.fetchMessagesFromWA === 'function') {
+        batch = await sock.fetchMessagesFromWA(jid, Math.min(50, max - fetched), cursor);
+      } else {
+        break; // no API disponible
+      }
+    } catch (e) {
+      log.warn({ slot, jid, err: String(e) }, 'loadMessages error');
+      break;
+    }
 
-    rows.push({
-      slot,
-      jid: remoteJid || participant,
-      from_number: tel,
-      ts: tsMs,
-      type: fromMe ? 'out' : 'in',
-      text
-    });
+    if (!batch || batch.length === 0) break;
+
+    // WhatsApp envía DESC a veces; ordenamos ASC para cursor “before”
+    batch.sort((a, b) => normTs(a) - normTs(b));
+
+    for (const m of batch) {
+      const jidRemote = m?.key?.remoteJid;
+      if (!jidRemote) continue;
+      const fromMe = !!m?.key?.fromMe;
+      const ts = normTs(m);
+      const node = m.message || {};
+      saveRow(slot, jidRemote, fromMe, node, ts);
+    }
+
+    fetched += batch.length;
+    // cursor “before” = primer mensaje del lote
+    const first = batch[0];
+    cursor = { before: first?.key, limit: 50 };
   }
-  const tx = db.transaction((items)=>{ for (const r of items) insMsg.run(r); });
-  tx(rows);
-  if (rows.length) log.info({ slot, saved: rows.length }, 'guardados');
+
+  return fetched;
 }
 
+/**
+ * Backfill de TODO el slot: itera chats del store y trae historial reciente.
+ */
+async function backfillSlot(slot) {
+  const sess = sessions[slot];
+  if (!sess?.sock || !sess?.store) return;
+  if (sess.backfilled) return; // correr una sola vez por arranque
+
+  const { sock, store } = sess;
+
+  const chats = store.chats?.all() || [];
+  log.info({ slot, chats: chats.length }, 'Backfill: inicio');
+
+  let totalFetched = 0;
+  for (const chat of chats) {
+    const jid = chat?.id;
+    if (!jid || jid.endsWith('@broadcast')) continue;
+    try {
+      const n = await pullHistoryForJid(slot, sock, jid, 200); // ← podés subir a 500/1000
+      totalFetched += n;
+      if (n > 0) log.info({ slot, jid, n }, 'Backfill: cargado');
+    } catch (e) {
+      log.warn({ slot, jid, err: String(e) }, 'Backfill: error jid');
+    }
+  }
+
+  sess.backfilled = true;
+  log.info({ slot, totalFetched }, 'Backfill: fin');
+}
+
+/**
+ * Arranca un slot (sesión).
+ */
 async function startSlot(slot) {
   const { state, saveCreds } = await useMultiFileAuthState(`data/auth_${slot}`);
   const { version } = await fetchLatestBaileysVersion();
+
+  const store = makeInMemoryStore({ logger: log });
+  store.readFromFile(`data/store_${slot}.json`);
+  setInterval(() => {
+    try { store.writeToFile(`data/store_${slot}.json`); } catch {}
+  }, 10_000);
 
   const sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: ['Mirror Dashboard','Chrome','1.0'],
+    browser: ['AutoBoulevard Dashboard', 'Chrome', '1.0'],
     emitOwnEvents: true,
-    // ⚠️ esto pide el historial inicial (history sync)
-    syncFullHistory: true
+    syncFullHistory: true, // importante para chats e historial
+    markOnlineOnConnect: false
   });
 
-  sessions[slot] = { sock, qr: null, status: 'starting', me: null };
+  store.bind(sock.ev);
+  sessions[slot] = { sock, store, qr: null, status: 'starting', me: null, backfilled: false };
+
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', ({ connection, qr, lastDisconnect }) => {
+  // Conexión / QR
+  sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
     if (qr) sessions[slot].qr = qr;
     if (connection === 'open') {
       sessions[slot].status = 'connected';
       sessions[slot].qr = null;
       sessions[slot].me = sock.user;
       log.info({ slot }, 'Conectado');
+      // en “open” lanzamos el backfill
+      backfillSlot(slot).catch(() => {});
     } else if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
       log.warn({ slot, code }, 'Desconectado, reintentando…');
@@ -151,33 +240,22 @@ async function startSlot(slot) {
     }
   });
 
-  // 🔹 history sync inicial: Baileys manda “messages.set”
-  sock.ev.on('messages.set', async ({ messages, isLatest }) => {
-    log.info({ slot, count: messages?.length || 0, isLatest }, 'messages.set');
-    if (messages?.length) await persistMessages(slot, messages);
+  // Mensajes NUEVOS en vivo
+  sock.ev.on('messages.upsert', ({ messages }) => {
+    log.debug({ slot, count: messages?.length || 0 }, 'messages.upsert');
+    for (const m of (messages || [])) {
+      const jid = m?.key?.remoteJid;
+      if (!jid) continue;
+      const fromMe = !!m?.key?.fromMe;
+      saveRow(slot, jid, fromMe, m.message || {}, normTs(m));
+    }
   });
-
-  // 🔹 mensajes nuevos / cambios
-  sock.ev.on('messages.upsert', async ({ type, messages }) => {
-    log.info({ slot, type, count: messages?.length || 0 }, 'messages.upsert');
-    if (messages?.length) await persistMessages(slot, messages);
-  });
-
-  // 🔹 utilitario: cargar más historial de un chat bajo demanda
-  sock.loadMoreFor = async (remoteJid, cursorId, count = 100) => {
-    const cursor = cursorId
-      ? { id: cursorId, fromMe: false, remoteJid }
-      : undefined;
-    const page = await sock.loadMessages(remoteJid, count, cursor);
-    await persistMessages(slot, page);
-    return page;
-  };
 }
 
-// levantar sesiones
+// Inicia todas las sesiones
 for (const s of SLOTS) startSlot(s);
 
-/* ==== API ==== */
+/* ====== ENDPOINTS ====== */
 
 // QR (PNG)
 app.get('/qr/:slot', async (req, res) => {
@@ -200,45 +278,49 @@ app.get('/status', (req, res) => {
   res.json(out);
 });
 
-// Últimos (rango)
-app.get('/last', (req, res) => {
-  const { slot, start, end, limit = 500 } = req.query;
-  const from = start ? new Date(start + 'T00:00:00Z').getTime() : 0;
-  const to   = end   ? new Date(end   + 'T23:59:59Z').getTime() : Date.now();
-  const rows = selLastRange.all(slot || null, slot || null, from, to, Math.min(Number(limit), 2000));
-  res.json(rows);
-});
-
-// Bandeja (conversaciones)
+// Bandeja (último mensaje por contacto, todos los slots)
 app.get('/chats', (req, res) => {
-  const slot  = (req.query.slot || 'all').toString().toLowerCase();
-  const limit = Math.min(Number(req.query.limit || 500), 2000);
-  const rows  = selChats.all(slot, slot, limit).map(r => ({
+  const limit = Math.min(Number(req.query.limit) || 1000, 5000);
+  const rows = selInbox.all(limit).map(r => ({
     slot: r.slot,
     from_number: r.from_number,
-    last_ts: r.last_ts,
-    last_text: r.last_text || '',
-    last_type: r.last_type || 'in'
+    jid: r.jid,
+    ts: r.ts,
+    lastType: r.type,
+    lastText: r.text
   }));
   res.json(rows);
 });
 
-// Historial por conversación (paginado)
+// Historial por contacto
+// GET /history?slot=slot1&from=5989...&before=ts&limit=200
 app.get('/history', (req, res) => {
-  const slot  = (req.query.slot || '').toString().toLowerCase();
-  const from  = (req.query.from || '').toString();
-  const before = req.query.before ? Number(req.query.before) : null;
-  const limit = Math.min(Number(req.query.limit || 200), 500);
-
+  const { slot, from, before, limit = 200 } = req.query;
   if (!slot || !from) return res.status(400).json({ error: 'slot y from requeridos' });
 
-  const desc = selHistoryDesc.all(slot, from, before, before, limit);
-  // devolvemos ascendente para pintar burbujas en orden
-  const asc = desc.slice().reverse();
-  res.json(asc);
+  const rows = selHistory.all(
+    String(slot),
+    String(from),
+    before ? Number(before) : null,
+    before ? Number(before) : null,
+    Math.min(Number(limit) || 200, 1000)
+  );
+
+  // Devolvemos ASC para pintar burbujas
+  rows.sort((a, b) => a.ts - b.ts);
+  res.json(rows);
 });
 
-// Healthcheck
-app.get('/health', (_, res)=>res.json({ ok:true }));
+// /last (sólo por compatibilidad)
+app.get('/last', (req, res) => {
+  const { slot, start, end, limit = 100 } = req.query;
+  const from = start ? new Date(start + 'T00:00:00Z').getTime() : 0;
+  const to   = end   ? new Date(end   + 'T23:59:59Z').getTime() : Date.now();
+  const rows = selLastRange.all(slot || null, slot || null, from, to, Math.min(Number(limit), 5000));
+  res.json(rows);
+});
 
-app.listen(PORT, () => log.info(`API espejo en :${PORT}`));
+// Health
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.listen(PORT, () => log.info(`API espejo escuchando en :${PORT}`));
