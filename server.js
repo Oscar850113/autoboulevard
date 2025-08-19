@@ -67,7 +67,7 @@ async function startSlot(slot) {
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: ['AutoBoulevard Dashboard','Chrome','1.0'],
+    browser: ['AutoBoulevard Dashboard', 'Chrome', '1.0'],
     syncFullHistory: false
   });
 
@@ -94,9 +94,10 @@ async function startSlot(slot) {
   sock.ev.on('messages.upsert', ({ messages }) => {
     for (const m of messages) {
       const remoteJid = m.key.remoteJid;
-      if (!remoteJid) continue;
-      const fromMe = m.key.fromMe;
+      const fromNumber = toTel(remoteJid);
+      if (!remoteJid || !fromNumber) continue;
 
+      const fromMe = m.key.fromMe;
       const msg = m.message || {};
       const text =
         msg.conversation ||
@@ -105,18 +106,22 @@ async function startSlot(slot) {
         msg.videoMessage?.caption ||
         '';
 
+      if (!text.trim()) continue; // evitar guardar mensajes vacíos
+
       const row = {
         slot,
         jid: remoteJid,
-        from_number: toTel(remoteJid),
-        ts: (m.messageTimestamp || m.timestamp || Math.floor(Date.now()/1000)) * 1000,
+        from_number: fromNumber,
+        ts: (m.messageTimestamp || m.timestamp || Math.floor(Date.now() / 1000)) * 1000,
         type: fromMe ? 'out' : 'in',
         text
       };
+
       insMsg.run(row);
     }
   });
 }
+
 
 // arranca las 3 sesiones
 for (const s of SLOTS) startSlot(s);
