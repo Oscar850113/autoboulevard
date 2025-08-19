@@ -1,10 +1,20 @@
-FROM node:20-alpine
-# deps para git y para compilar better-sqlite3
-RUN apk add --no-cache git python3 make g++ sqlite-dev
+# Usa la imagen oficial de Node
+FROM node:20
+
+# Crea directorio de trabajo
 WORKDIR /app
+
+# Copia package.json y package-lock.json primero
 COPY package*.json ./
-RUN npm ci --omit=dev || npm install --omit=dev
+
+# Instala dependencias
+RUN npm install --omit=dev
+
+# Copia el resto del código
 COPY . .
+
+# Exponer puerto 3000
 EXPOSE 3000
-VOLUME ["/app/data"]
-CMD ["node","server.js"]
+
+# Comando de inicio
+CMD ["node", "server.js"]
