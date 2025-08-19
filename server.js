@@ -91,35 +91,38 @@ async function startSlot(slot) {
     }
   });
 
-  sock.ev.on('messages.upsert', ({ messages }) => {
-    for (const m of messages) {
-      const remoteJid = m.key.remoteJid;
-      const fromNumber = toTel(remoteJid);
-      if (!remoteJid || !fromNumber) continue;
-
-      const fromMe = m.key.fromMe;
-      const msg = m.message || {};
-      const text =
-        msg.conversation ||
-        msg.extendedTextMessage?.text ||
-        msg.imageMessage?.caption ||
-        msg.videoMessage?.caption ||
-        '';
-
-      if (!text.trim()) continue; // evitar guardar mensajes vacíos
-
-      const row = {
-        slot,
-        jid: remoteJid,
-        from_number: fromNumber,
-        ts: (m.messageTimestamp || m.timestamp || Math.floor(Date.now() / 1000)) * 1000,
-        type: fromMe ? 'out' : 'in',
-        text
-      };
-
-      insMsg.run(row);
+sock.ev.on('messages.upsert', ({ messages }) => {
+  console.log(`🟢 ${messages.length} mensaje(s) recibidos para ${slot}`);
+  for (const m of messages) {
+    const remoteJid = m.key.remoteJid;
+    if (!remoteJid || !toTel(remoteJid)) {
+      console.warn(`⚠️ remoteJid inválido`, m);
+      continue;
     }
-  });
+
+    const fromMe = m.key.fromMe;
+    const msg = m.message || {};
+    const text =
+      msg.conversation ||
+      msg.extendedTextMessage?.text ||
+      msg.imageMessage?.caption ||
+      msg.videoMessage?.caption ||
+      '';
+
+    const row = {
+      slot,
+      jid: remoteJid,
+      from_number: toTel(remoteJid),
+      ts: (m.messageTimestamp || m.timestamp || Math.floor(Date.now()/1000)) * 1000,
+      type: fromMe ? 'out' : 'in',
+      text
+    };
+
+    console.log(`💬 Guardando mensaje`, row);
+    insMsg.run(row);
+  }
+});
+
 }
 
 
