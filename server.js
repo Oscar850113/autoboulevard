@@ -12,6 +12,7 @@ import {
   makeInMemoryStore
 } from '@whiskeysockets/baileys';
 
+/* ===================== Config ===================== */
 const PORT   = process.env.PORT || 3000;
 const ORIGIN = process.env.ALLOW_ORIGIN || '*';
 const SLOTS  = (process.env.SLOTS || 'slot1,slot2,slot3').split(',').map(s=>s.trim());
@@ -31,8 +32,11 @@ CREATE TABLE IF NOT EXISTS messages(
   type TEXT,
   text TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_ts ON messages(ts);
-CREATE INDEX IF NOT EXISTS idx_slot_from_ts ON messages(slot, from_number, ts);
+CREATE INDEX  IF NOT EXISTS idx_ts              ON messages(ts);
+CREATE INDEX  IF NOT EXISTS idx_slot_from_ts    ON messages(slot, from_number, ts);
+/* índice único para evitar duplicados por backfill + upsert */
+CREATE UNIQUE INDEX IF NOT EXISTS uq_msg ON messages(slot, jid, ts, type, text);
+
 CREATE TABLE IF NOT EXISTS tags(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   from_number TEXT NOT NULL,
@@ -41,7 +45,7 @@ CREATE TABLE IF NOT EXISTS tags(
 );
 `);
 const insMsg = db.prepare(`
-  INSERT INTO messages (slot, jid, from_number, ts, type, text)
+  INSERT OR IGNORE INTO messages (slot, jid, from_number, ts, type, text)
   VALUES (@slot, @jid, @from_number, @ts, @type, @text)
 `);
 const selLast = db.prepare(`
@@ -50,7 +54,6 @@ const selLast = db.prepare(`
   WHERE (? IS NULL OR slot = ?) AND ts BETWEEN ? AND ?
   ORDER BY ts DESC LIMIT ?
 `);
-/* último mensaje por hilo (slot + from_number) */
 const selThreads = db.prepare(`
   SELECT m1.slot, m1.jid, m1.from_number, m1.ts AS last_ts, m1.type AS last_type, m1.text AS last_text
   FROM messages m1
@@ -60,15 +63,14 @@ const selThreads = db.prepare(`
     GROUP BY slot, from_number
   ) x ON x.slot = m1.slot AND x.from_number = m1.from_number AND x.max_ts = m1.ts
   ORDER BY last_ts DESC
-  LIMIT ?;
+  LIMIT ?
 `);
-/* historial por contacto */
 const selHistoryAsc = db.prepare(`
   SELECT slot, jid, from_number, ts, type, text
   FROM messages
   WHERE slot = ? AND from_number = ? AND (? IS NULL OR ts < ?)
   ORDER BY ts ASC
-  LIMIT ?;
+  LIMIT ?
 `);
 
 /* ===================== Helpers ===================== */
@@ -90,11 +92,16 @@ const txtOf = (m) => {
 
 /* ===================== Express ===================== */
 const app = express();
-app.use(cors({ origin: ORIGIN }));
+app.use(cors({
+  origin: ORIGIN,
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type']
+}));
+app.options('*', cors());
 app.use(express.json());
 
 /* ===================== WA sessions ===================== */
-const sessions = {}; // slot -> { sock, qr, status, me, store, isBackfilled }
+const sessions = {}; // slot -> { sock, store, qr, status, me, isBackfilled }
 
 async function startSlot(slot) {
   const { state, saveCreds } = await useMultiFileAuthState(`data/auth_${slot}`);
@@ -106,7 +113,8 @@ async function startSlot(slot) {
     printQRInTerminal: false,
     browser: ['AutoBoulevard Dashboard', 'Chrome', '1.0'],
     emitOwnEvents: true,
-    syncFullHistory: true // <- pide historial inicial
+    // intentamos clonar cuanto se pueda
+    syncFullHistory: true
   });
 
   const store = makeInMemoryStore({ logger: log });
@@ -125,29 +133,33 @@ async function startSlot(slot) {
       sessions[slot].me = sock.user;
       log.info({ slot }, 'Conectado');
 
-      /* dispara backfill en background (1 sola vez) */
+      // Backfill 1 sola vez al abrir
       if (!sessions[slot].isBackfilled) {
         try {
           await backfillAllChats(slot);
           sessions[slot].isBackfilled = true;
         } catch (e) {
-          log.error({ slot, err: e }, 'Backfill falló');
+          log.error({ slot, err: String(e) }, 'backfill fallo');
         }
       }
     } else if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
       log.warn({ slot, code }, 'Desconectado, reintentando…');
-      if (code !== DisconnectReason.loggedOut) startSlot(slot);
-      else sessions[slot].status = 'logged_out';
+      if (code !== DisconnectReason.loggedOut) {
+        setTimeout(()=>startSlot(slot), 1500);
+      } else {
+        sessions[slot].status = 'logged_out';
+      }
     } else if (connection) {
       sessions[slot].status = connection;
     }
   });
 
-  /* historial “oficial” que entrega WA al inicio */
+  /* historial inicial de WA */
   sock.ev.on('messaging-history.set', ({ messages, isLatest }) => {
-    log.info({ slot, count: messages?.length || 0, isLatest }, 'history.set');
-    for (const m of messages || []) {
+    const list = messages || [];
+    log.info({ slot, count: list.length, isLatest }, 'history.set');
+    for (const m of list) {
       const remoteJid = m?.key?.remoteJid;
       if (!remoteJid) continue;
       const fromMe = !!m?.key?.fromMe;
@@ -184,31 +196,29 @@ async function startSlot(slot) {
     }
   });
 
-  /* opcional: persistencia periódica del store (debug) */
+  /* snapshot de store (opcional debug) */
   const storePath = `data/store_${slot}.json`;
   setInterval(() => {
     try {
-      const snapshot = {
-        chats: store.chats.all(),
-      };
+      const snapshot = { chats: store.chats.all() };
       fs.writeFileSync(storePath, JSON.stringify(snapshot));
     } catch {}
   }, 30000);
 }
 
-/* ==== Backfill explícito por cada chat (casi “clon”) ==== */
-/* Usa loadMessages (v6+) o fetchMessageHistory (fallback) */
+/* ========= Backfill (clon de chats) ========= */
 async function backfillChat(slot, jid, maxBatches = 200, batchSize = 50) {
   const sess = sessions[slot];
   if (!sess) return;
   const sock = sess.sock;
-  const load = sock.loadMessages || sock.fetchMessageHistory;
+  const load = sock.loadMessages || sock.fetchMessageHistory; // distintas versiones
   if (!load) return;
 
   let cursor = null;
   for (let i = 0; i < maxBatches; i++) {
+    // algunas versiones devuelven array, otras { messages: [...] }
     const page = await load.call(sock, jid, batchSize, cursor);
-    const msgs = Array.isArray(page) ? page : page?.messages || [];
+    const msgs = Array.isArray(page) ? page : (page?.messages || []);
     if (!msgs.length) break;
 
     for (const m of msgs) {
@@ -228,8 +238,9 @@ async function backfillChat(slot, jid, maxBatches = 200, batchSize = 50) {
     }
 
     const last = msgs[msgs.length - 1];
+    if (!last?.key?.id) break;
     cursor = { id: last.key.id, fromMe: last.key.fromMe, remoteJid: jid };
-    if (msgs.length < batchSize) break; // llegó al fondo del chat
+    if (msgs.length < batchSize) break;
   }
 }
 
@@ -238,7 +249,7 @@ async function backfillAllChats(slot) {
   if (!sess) return;
   const store = sess.store;
 
-  // si no hay lista de chats aún, espera un poco
+  // espera a que lleguen los chats
   for (let i = 0; i < 20 && store.chats.all().length === 0; i++) {
     await new Promise(r => setTimeout(r, 1000));
   }
@@ -249,54 +260,26 @@ async function backfillAllChats(slot) {
     try {
       await backfillChat(slot, c.id);
     } catch (e) {
-      log.warn({ slot, jid: c.id, err: e?.message }, 'backfill chat error');
+      log.warn({ slot, jid: c.id, err: String(e) }, 'backfill chat error');
     }
   }
   log.info({ slot }, 'CLONE backfill done');
 }
 
-// --- helper opcional para cerrar sesión/limpiar ---
+/* ========= Reset / Logout ========= */
 async function resetSlot(slot) {
   const sess = sessions[slot];
 
-  // Intenta cerrar sesión en WA (si está conectada)
-  try { await sess?.sock?.logout?.(); } catch (e) { log.warn({ slot, e: String(e) }, 'logout() falló'); }
+  try { await sess?.sock?.logout?.(); } catch (e) { log.warn({ slot, e: String(e) }, 'logout falló'); }
   try { sess?.sock?.end?.(); } catch (_) {}
   try { sess?.sock?.ws?.close?.(); } catch (_) {}
-
-  // Limpia listeners y sesión en memoria
   try { sess?.sock?.ev?.removeAllListeners?.(); } catch (_) {}
-  delete sessions[slot];
 
-  // Borra credenciales locales del slot
+  delete sessions[slot];
   try { fs.rmSync(`data/auth_${slot}`, { recursive: true, force: true }); } catch (_) {}
 
-  // Reinicia el slot -> el estado quedará "starting" y luego emitirá QR
-  await startSlot(slot);
+  await startSlot(slot); // reinicia: pedirá QR
 }
-
-// --- CORS (si quieres ser explícito con métodos/post) ---
-app.use(cors({
-  origin: ORIGIN,
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type']
-}));
-app.options('*', cors());
-
-// --- NUEVO: logout de un slot ---
-app.post('/logout/:slot', async (req, res) => {
-  const slot = (req.params.slot || '').trim();
-  if (!slot || !SLOTS.includes(slot)) {
-    return res.status(400).json({ ok:false, error:'invalid_slot' });
-  }
-  try {
-    await resetSlot(slot);
-    res.json({ ok:true, slot, restarted:true });
-  } catch (err) {
-    log.error({ slot, err }, 'logout_failed');
-    res.status(500).json({ ok:false, error:'logout_failed' });
-  }
-});
 
 /* ===== arrancar slots ===== */
 for (const s of SLOTS) startSlot(s);
@@ -324,7 +307,7 @@ app.get('/status', (req, res) => {
   res.json(out);
 });
 
-/* últimos mensajes (para KPIs/gráficas) */
+/* últimos mensajes (KPIs / tabla) */
 app.get('/last', (req, res) => {
   const { slot, start, end, limit = 500 } = req.query;
   const from = start ? new Date(start + 'T00:00:00Z').getTime() : 0;
@@ -346,36 +329,29 @@ app.get('/chats', (req, res) => {
   }));
   res.json(rows);
 });
-// Forzar logout y volver a pedir QR para un slot
-app.post('/logout/:slot', async (req, res) => {
-  const slot = req.params.slot;
-  const sess = sessions[slot];
-  try {
-    if (sess?.sock) {
-      try { await sess.sock.logout(); }
-      catch (e) { log.warn({ slot, err: String(e) }, 'logout() falló, borro auth igualmente'); }
-    }
-    // borrar credenciales y sesión en disco
-    try { fs.rmSync(`data/auth_${slot}`, { recursive: true, force: true }); } catch (_) {}
-    delete sessions[slot];
 
-    // arrancar de cero para que emita QR
-    await startSlot(slot);
-
-    res.json({ ok: true });
-  } catch (err) {
-    log.error({ slot, err }, 'logout error');
-    res.status(500).json({ ok: false, error: 'logout_failed' });
-  }
-});
-
-/* historial por contacto */
+/* historial por contacto (ascendente) */
 app.get('/history', (req, res) => {
   const { slot, from, before, limit = 200 } = req.query;
   if (!slot || !from) return res.status(400).json({ error: 'slot y from requeridos' });
   const b = before ? Number(before) : null;
   const rows = selHistoryAsc.all(slot, from, b, b, Math.min(Number(limit), 1000));
   res.json(rows);
+});
+
+/* logout (desconexión forzada) */
+app.post('/logout/:slot', async (req, res) => {
+  const slot = (req.params.slot || '').trim();
+  if (!slot || !SLOTS.includes(slot)) {
+    return res.status(400).json({ ok:false, error:'invalid_slot' });
+  }
+  try {
+    await resetSlot(slot);
+    res.json({ ok:true, slot, restarted:true });
+  } catch (err) {
+    log.error({ slot, err: String(err) }, 'logout_failed');
+    res.status(500).json({ ok:false, error:'logout_failed' });
+  }
 });
 
 /* tags / health */
@@ -386,7 +362,7 @@ app.post('/tag', (req, res) => {
     .run(from_number, tag, Date.now());
   res.json({ ok: true });
 });
+
 app.get('/health', (_, res)=>res.json({ ok:true }));
 
 app.listen(PORT, () => log.info(`API espejo en :${PORT}`));
-
