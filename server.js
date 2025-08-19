@@ -346,7 +346,17 @@ app.post('/logout/:slot', async (req, res) => {
     return res.status(400).json({ ok:false, error:'invalid_slot' });
   }
   try {
-    await resetSlot(slot);
+    const sess = sessions[slot];
+
+    try { await sess?.sock?.logout?.(); } catch (e) { log.warn({ slot, e: String(e) }, 'logout() falló'); }
+    try { sess?.sock?.end?.(); } catch (_) {}
+    try { sess?.sock?.ws?.close?.(); } catch (_) {}
+    try { sess?.sock?.ev?.removeAllListeners?.(); } catch (_) {}
+
+    delete sessions[slot];
+    try { fs.rmSync(`data/auth_${slot}`, { recursive: true, force: true }); } catch (_) {}
+
+    await startSlot(slot); // reinicia: quedará “starting” y emitirá QR
     res.json({ ok:true, slot, restarted:true });
   } catch (err) {
     log.error({ slot, err: String(err) }, 'logout_failed');
