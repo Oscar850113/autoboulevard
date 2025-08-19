@@ -192,4 +192,24 @@ app.post('/tag', (req, res) => {
 // Healthcheck
 app.get('/health', (_, res)=>res.json({ ok:true }));
 
+// Dummy chats (para pruebas)
+app.get('/chats', (req, res) => {
+  res.json([
+    {
+      name: "Cliente X",
+      lastMessage: "Hola",
+      timeAgo: "2m",
+      slot: "slot1",
+      initials: "CX"
+    },
+    {
+      name: "Cliente Y",
+      lastMessage: "Consulta",
+      timeAgo: "5m",
+      slot: "slot2",
+      initials: "CY"
+    }
+  ]);
+});
+
 app.listen(PORT, () => log.info(`API espejo en :${PORT}`));
