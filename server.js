@@ -223,13 +223,6 @@ app.get('/chats', (req, res) => {
       timeAgo: "2m",
       slot: "slot1",
       initials: "CX"
-    },
-    {
-      name: "Cliente Y",
-      lastMessage: "Consulta",
-      timeAgo: "5m",
-      slot: "slot2",
-      initials: "CY"
     }
   ]);
 });
