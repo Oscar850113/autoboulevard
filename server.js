@@ -103,16 +103,26 @@ async function startSlot(slot) {
       const fromMe = m.key.fromMe;
       const msg = m.message || {};
 
-      let text = '';
-      if (msg.conversation) text = msg.conversation;
-      else if (msg.extendedTextMessage?.text) text = msg.extendedTextMessage.text;
-      else if (msg.imageMessage?.caption) text = msg.imageMessage.caption;
-      else if (msg.videoMessage?.caption) text = msg.videoMessage.caption;
-      else if (msg.buttonsResponseMessage?.selectedButtonId) text = msg.buttonsResponseMessage.selectedButtonId;
-      else if (msg.listResponseMessage?.title) text = msg.listResponseMessage.title;
-      else if (msg.listResponseMessage?.singleSelectReply?.selectedRowId) text = msg.listResponseMessage.singleSelectReply.selectedRowId;
-      else if (msg.templateButtonReplyMessage?.selectedId) text = msg.templateButtonReplyMessage.selectedId;
-      else text = '[mensaje no soportado]';
+let text = '';
+
+if (msg.conversation) text = msg.conversation;
+else if (msg.extendedTextMessage?.text) text = msg.extendedTextMessage.text;
+else if (msg.imageMessage?.caption) text = msg.imageMessage.caption;
+else if (msg.videoMessage?.caption) text = msg.videoMessage.caption;
+else if (msg.documentMessage?.caption) text = msg.documentMessage.caption;
+else if (msg.buttonsResponseMessage?.selectedButtonId) text = msg.buttonsResponseMessage.selectedButtonId;
+else if (msg.listResponseMessage?.title) text = msg.listResponseMessage.title;
+else if (msg.listResponseMessage?.singleSelectReply?.selectedRowId) text = msg.listResponseMessage.singleSelectReply.selectedRowId;
+else if (msg.templateButtonReplyMessage?.selectedId) text = msg.templateButtonReplyMessage.selectedId;
+else if (msg.messageContextInfo?.quotedMessage?.conversation) text = msg.messageContextInfo.quotedMessage.conversation;
+else if (msg.reactionMessage?.text) text = `Reaccionó: ${msg.reactionMessage.text}`;
+else if (msg.audioMessage) text = '[audio]';
+else if (msg.stickerMessage) text = '[sticker]';
+else if (msg.contactMessage) text = '[contacto]';
+else if (msg.locationMessage) text = '[ubicación]';
+else if (msg.documentMessage) text = '[documento]';
+else text = '[mensaje no soportado]';
+
 
       const row = {
         slot,
